@@ -52,6 +52,9 @@ export default defineConfig(async ({ command }) => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
+    // Pre-bundle client libraries used by the CRM views so the dev server never re-optimizes
+    // mid-session (a re-optimization leaves the browser with two React copies → "Invalid hook call").
+    optimizeDeps: { include: ["react", "react-dom", "react-dom/client", "recharts", "xlsx", "lucide-react"] },
     server: {
       ...(managedLinux
         ? { host: "0.0.0.0", allowedHosts: ["terminal.local"] }

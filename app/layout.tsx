@@ -4,6 +4,7 @@ import "@fontsource/m-plus-rounded-1c/500.css";
 import "@fontsource/m-plus-rounded-1c/700.css";
 import "@fontsource/m-plus-rounded-1c/800.css";
 import "./globals.css";
+import "./crm/crm.css";
 
 export const metadata: Metadata = {
   title: "裕信汽車｜零服UIO管理系統",

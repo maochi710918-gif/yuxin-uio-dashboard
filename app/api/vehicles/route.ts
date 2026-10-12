@@ -1,4 +1,6 @@
 import * as XLSX from "xlsx";
+import { type Actor, errorResponse, requireActor } from "../../../lib/crm/auth";
+import { dataVersion, hasCrmVehicles, loadAnalyticsRecords } from "../../../lib/crm/analytics-source";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,12 +27,17 @@ type Vehicle = {
   brakePadLastChanged: string; beltLastChanged: string; sparkPlugLastChanged: string;
   contactAuthorized: string; doNotContact: boolean; nextBestAction: string;
 };
-type IndexedVehicle = Vehicle & { _search: string; _priority: number };
+type IndexedVehicle = Vehicle & { _search: string; _priority: number; _salesCode?: string | null; _advisorCode?: string | null; _unitCode?: string | null; _unitFormal?: boolean };
 
 let recordCache: IndexedVehicle[] | null = null;
 // Day counts must use the dataset's 資料基準日 (as the build script does), not today.
 let referenceTime = Date.now();
+// Latest work-order date in the extract; it can trail 資料基準日 when the export lags behind.
+let latestVisit = "";
 let loadingCache: Promise<IndexedVehicle[]> | null = null;
+let cacheVersion = "";
+let cacheSource: "D1" | "json" = "json";
+let cacheAsOf = "";
 
 function warrantyGroup(status: string) {
   return status.startsWith("即將過保") ? "即將過保" : status.startsWith("已過保") ? "已過保" : status;
@@ -55,10 +62,22 @@ function vehiclePriority(vehicle: Vehicle) {
     - (vehicle.doNotContact ? 10 : 0);
 }
 
+// Records come from the CRM tables once data has been imported (single ingestion path); the legacy
+// public/data/vehicles.json snapshot is only a fallback before the first import.
 async function loadRecords(requestUrl: string) {
-  if (recordCache) return recordCache;
-  if (loadingCache) return loadingCache;
+  const version = await dataVersion();
+  if (recordCache && cacheVersion === version) return recordCache;
+  if (loadingCache && cacheVersion === version) return loadingCache;
+  cacheVersion = version;
   loadingCache = (async () => {
+    if (await hasCrmVehicles()) {
+      const { records, asOf, asOfDate } = await loadAnalyticsRecords();
+      referenceTime = asOf;
+      cacheAsOf = asOfDate;
+      cacheSource = "D1";
+      return indexRecords(records as unknown as IndexedVehicle[]);
+    }
+    cacheSource = "json";
     const dataUrl = new URL("/data/vehicles.json", requestUrl);
     const [response, metadataResponse] = await Promise.all([fetch(dataUrl, { cache: "no-store" }), fetch(new URL("/data/metadata.json", requestUrl), { cache: "no-store" })]);
     if (metadataResponse.ok) {
@@ -67,19 +86,37 @@ async function loadRecords(requestUrl: string) {
       if (Number.isFinite(parsed)) referenceTime = parsed;
     }
     if (!response.ok) throw new Error("無法讀取本機車輛資料");
-    const source = await response.json() as Vehicle[];
-    const indexed = source as IndexedVehicle[];
+    return indexRecords(await response.json() as IndexedVehicle[]);
+  })().catch((error) => { loadingCache = null; recordCache = null; throw error; });
+  return loadingCache;
+}
+
+function indexRecords(indexed: IndexedVehicle[]) {
     for (const vehicle of indexed) {
       Object.defineProperties(vehicle, {
         _search: { value: [vehicle.code, vehicle.county, vehicle.district, vehicle.model, vehicle.modelCode, vehicle.branch, vehicle.advisor, vehicle.salesRepresentative, vehicle.technician, vehicle.memberPassport, vehicle.returnCategory].join("|").toUpperCase().replace(/[\s-]/g, "") },
         _priority: { value: vehiclePriority(vehicle) },
       });
     }
+    latestVisit = indexed.reduce((latest, vehicle) => vehicle.lastVisit > latest ? vehicle.lastVisit : latest, "");
     indexed.sort((a, b) => b._priority - a._priority || a.code.localeCompare(b.code));
     recordCache = indexed;
     return indexed;
-  })();
-  return loadingCache;
+}
+
+/** Server-side authorisation: each role only receives its own vehicles (the URL role parameter has no effect). */
+function scopeRecords(records: IndexedVehicle[], actor: Actor) {
+  if (actor.role === "company_manager") return records;
+  if (cacheSource !== "D1") return [];
+  if (actor.role === "branch_manager") return records.filter((vehicle) => vehicle._unitCode && vehicle._unitCode === actor.unitCode);
+  const own = actor.role === "sales" ? (vehicle: IndexedVehicle) => vehicle._salesCode : (vehicle: IndexedVehicle) => vehicle._advisorCode;
+  return records.filter((vehicle) => actor.staffCode && own(vehicle) === actor.staffCode);
+}
+
+function metadataFor(records: IndexedVehicle[]) {
+  const ranked = (pick: (vehicle: IndexedVehicle) => string) => { const counts = new Map<string, number>(); for (const vehicle of records) { const value = pick(vehicle); if (value) counts.set(value, (counts.get(value) || 0) + 1); } return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([name]) => name); };
+  return { source: cacheSource === "D1" ? "平台資料庫（匯入批次）" : "舊版快照 vehicles.json", dataSource: cacheSource, deidentified: true, asOf: cacheAsOf || new Date(referenceTime).toISOString().slice(0, 10), recordCount: records.length,
+    models: ranked((v) => v.model), counties: ranked((v) => v.county), branches: ranked((v) => v.branch), advisors: ranked((v) => v.advisor), technicians: ranked((v) => v.technician), salesRepresentatives: ranked((v) => v.salesRepresentative) };
 }
 
 function numberParam(params: URLSearchParams, key: string) {
@@ -159,6 +196,8 @@ function filterRecords(records: IndexedVehicle[], params: URLSearchParams, optio
   const minServiceSpend = numberParam(params, "minServiceSpend"), minServiceCount = numberParam(params, "minServiceCount");
   const minDaysSinceService = numberParam(params, "minDaysSinceService");
   const excludeDoNotContact = params.get("excludeDoNotContact") === "true";
+  const contactableOnly = params.get("contactableOnly") === "true";
+  const exactPerson = params.get("exactPerson") === "true";
   return records.filter((vehicle) => {
     if (keyword && !vehicle._search.includes(keyword)) return false;
     if (model && vehicle.model !== model) return false;
@@ -166,9 +205,9 @@ function filterRecords(records: IndexedVehicle[], params: URLSearchParams, optio
     const vehicleDistrict = normalizedDistrict(vehicle.county, vehicle.district);
     if (!options.ignoreDistrict && district && (district === "__EMPTY__" ? Boolean(vehicleDistrict) : vehicleDistrict !== district)) return false;
     if (branch && vehicle.branch !== branch) return false;
-    if (advisor && !vehicle.advisor.toLocaleUpperCase("zh-TW").includes(advisor.toLocaleUpperCase("zh-TW"))) return false;
-    if (technician && !vehicle.technician.toLocaleUpperCase("zh-TW").includes(technician.toLocaleUpperCase("zh-TW"))) return false;
-    if (salesRepresentative && !vehicle.salesRepresentative.toLocaleUpperCase("zh-TW").includes(salesRepresentative.toLocaleUpperCase("zh-TW"))) return false;
+    if (advisor && !matchesPerson(vehicle.advisor, advisor, exactPerson)) return false;
+    if (technician && !matchesPerson(vehicle.technician, technician, exactPerson)) return false;
+    if (salesRepresentative && !matchesPerson(vehicle.salesRepresentative, salesRepresentative, exactPerson)) return false;
     if (recommendedAction && vehicle.nextBestAction !== recommendedAction) return false;
     if (warranty && warrantyGroup(vehicle.warrantyStatus) !== warranty) return false;
     if (gender && vehicle.gender !== gender) return false;
@@ -182,6 +221,7 @@ function filterRecords(records: IndexedVehicle[], params: URLSearchParams, optio
     if (serviceCategory === "tire" && (vehicle.tireChanges1y ?? 0) <= 0) return false;
     if (serviceCategory === "battery" && (vehicle.batteryChanges1y ?? 0) <= 0) return false;
     if (excludeDoNotContact && vehicle.doNotContact) return false;
+    if (contactableOnly && !isContactable(vehicle)) return false;
     if (minAge !== null && (vehicle.vehicleAge === null || vehicle.vehicleAge < minAge)) return false;
     if (maxAge !== null && (vehicle.vehicleAge === null || vehicle.vehicleAge > maxAge)) return false;
     if (minCustomerAge !== null && (vehicle.customerAge === null || vehicle.customerAge < minCustomerAge)) return false;
@@ -216,6 +256,45 @@ function isContactable(vehicle: Vehicle) {
   return vehicle.hasMobile && !vehicle.doNotContact && `${vehicle.ownerAuthorization}|${vehicle.contactAuthorized}`.includes("同意");
 }
 
+// Typed names match partially; a name picked from the 服務金三角 roster matches exactly ("未指派" = blank).
+function matchesPerson(value: string, query: string, exact: boolean) {
+  if (exact) return query === "未指派" ? !value : value === query;
+  return value.toLocaleUpperCase("zh-TW").includes(query.toLocaleUpperCase("zh-TW"));
+}
+
+const peopleRoles = { advisor: (v: Vehicle) => v.advisor, technician: (v: Vehicle) => v.technician, salesRepresentative: (v: Vehicle) => v.salesRepresentative } as const;
+type PeopleRole = keyof typeof peopleRoles;
+const MIN_AVERAGE_SAMPLE = 5;
+const peopleSortKeys = ["vehicles", "spendAverage", "expiring", "dormant", "contactable"] as const;
+
+// Roster for one 金三角 role, under every active filter except that role's own name filter.
+function summarizePeople(records: IndexedVehicle[], params: URLSearchParams, role: PeopleRole) {
+  const base = new URLSearchParams(params);
+  base.delete(role);
+  const read = peopleRoles[role];
+  const people = new Map<string, { name: string; vehicles: number; spend: number; spendVehicles: number; expiring: number; dormant: number; contactable: number }>();
+  for (const vehicle of filterRecords(records, base)) {
+    const name = read(vehicle) || "未指派";
+    const person = people.get(name) || { name, vehicles: 0, spend: 0, spendVehicles: 0, expiring: 0, dormant: 0, contactable: 0 };
+    person.vehicles += 1;
+    person.spend += vehicle.spend3m ?? 0;
+    if ((vehicle.spend3m ?? 0) > 0) person.spendVehicles += 1;
+    if (vehicle.warrantyStatus.startsWith("即將過保")) person.expiring += 1;
+    if ((vehicle.daysSinceVisit ?? 0) >= 365) person.dormant += 1;
+    if (isContactable(vehicle)) person.contactable += 1;
+    people.set(name, person);
+  }
+  const search = (params.get("peopleSearch") || "").trim().toLocaleUpperCase("zh-TW");
+  const sortKey = (peopleSortKeys as readonly string[]).includes(params.get("peopleSort") || "") ? params.get("peopleSort")! : "vehicles";
+  const value = (person: { vehicles: number; spend: number; spendVehicles: number; [key: string]: number | string }) => sortKey === "spendAverage" ? (person.spendVehicles ? person.spend / person.spendVehicles : 0) : Number(person[sortKey]);
+  const rows = [...people.values()].map((person) => ({ ...person, spendAverage: person.spendVehicles ? Math.round(person.spend / person.spendVehicles) : 0 }));
+  const matched = rows.filter((person) => !search || person.name.toLocaleUpperCase("zh-TW").includes(search));
+  // Averages from a handful of vehicles are noise: rank people below the minimum sample after everyone else.
+  const thin = (person: { spendVehicles: number }) => sortKey === "spendAverage" && person.spendVehicles < MIN_AVERAGE_SAMPLE ? 1 : 0;
+  matched.sort((a, b) => thin(a) - thin(b) || value(b) - value(a) || b.vehicles - a.vehicles);
+  return { role, total: rows.length, matched: matched.length, minSample: MIN_AVERAGE_SAMPLE, rows: matched.slice(0, 60) };
+}
+
 function summarizeDistricts(records: IndexedVehicle[]) {
   const districtMap = new Map<string, number>();
   for (const vehicle of records) {
@@ -228,10 +307,17 @@ function summarizeDistricts(records: IndexedVehicle[]) {
 function summarize(records: IndexedVehicle[]) {
   const mileageBands = [0, 0, 0, 0, 0];
   const warranty = { 保固內: 0, 即將過保: 0, 已過保: 0, 待確認: 0 };
-  const branchMap = new Map<string, { name: string; vehicles: number; dormant: number; expiring: number; spend: number }>();
+  const branchMap = new Map<string, { name: string; vehicles: number; dormant: number; expiring: number; spend: number; spendVehicles: number }>();
   const countyMap = new Map<string, number>();
   const serviceMix = { 定期保養: 0, 美容服務: 0, 輪胎: 0, 電瓶: 0 };
-  let expiring = 0, dormant = 0, spend = 0, contactable = 0;
+  // Last-visit month buckets: the 12 calendar months ending at the latest work order in the data.
+  const base = latestVisit ? new Date(`${latestVisit}T00:00:00`) : new Date(referenceTime);
+  const monthKeys = Array.from({ length: 12 }, (_, i) => { const d = new Date(base.getFullYear(), base.getMonth() - 11 + i, 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; });
+  const monthCounts = new Map(monthKeys.map((key) => [key, 0]));
+  const weekdays = [0, 0, 0, 0, 0, 0, 0];
+  const modelMap = new Map<string, number>();
+  const branchWarrantyMap = new Map<string, { name: string; vehicles: number; 保固內: number; 即將過保: number; 已過保: number; 待確認: number }>();
+  let expiring = 0, dormant = 0, spend = 0, spendVehicles = 0, contactable = 0;
   for (const vehicle of records) {
     if (isContactable(vehicle)) contactable += 1;
     const group = warrantyGroup(vehicle.warrantyStatus) as keyof typeof warranty;
@@ -239,17 +325,32 @@ function summarize(records: IndexedVehicle[]) {
     if (group === "即將過保") expiring += 1;
     if ((vehicle.daysSinceVisit ?? 0) >= 365) dormant += 1;
     spend += vehicle.spend3m ?? 0;
+    if ((vehicle.spend3m ?? 0) > 0) spendVehicles += 1;
     if (vehicle.mileage !== null) mileageBands[vehicle.mileage < 30000 ? 0 : vehicle.mileage < 50000 ? 1 : vehicle.mileage < 80000 ? 2 : vehicle.mileage < 100000 ? 3 : 4] += 1;
     if ((vehicle.maintenanceCount1y ?? 0) > 0) serviceMix.定期保養 += 1;
     if ((vehicle.beautySpend1y ?? 0) > 0) serviceMix.美容服務 += 1;
     if ((vehicle.tireChanges1y ?? 0) > 0) serviceMix.輪胎 += 1;
     if ((vehicle.batteryChanges1y ?? 0) > 0) serviceMix.電瓶 += 1;
+    if (vehicle.lastVisit) {
+      const month = vehicle.lastVisit.slice(0, 7);
+      if (monthCounts.has(month)) monthCounts.set(month, (monthCounts.get(month) || 0) + 1);
+      const day = new Date(`${vehicle.lastVisit}T00:00:00`).getDay();
+      if (Number.isFinite(day)) weekdays[(day + 6) % 7] += 1;
+    }
+    const modelName = vehicle.model || "未分類";
+    modelMap.set(modelName, (modelMap.get(modelName) || 0) + 1);
+    const warrantyBranchName = vehicle.branch || "未指定服務廠";
+    const warrantyBranch = branchWarrantyMap.get(warrantyBranchName) || { name: warrantyBranchName, vehicles: 0, 保固內: 0, 即將過保: 0, 已過保: 0, 待確認: 0 };
+    warrantyBranch.vehicles += 1;
+    if (group in warranty) warrantyBranch[group] += 1;
+    branchWarrantyMap.set(warrantyBranchName, warrantyBranch);
     const countyName = canonicalCounty(vehicle.county);
     countyMap.set(countyName || "待確認", (countyMap.get(countyName || "待確認") || 0) + 1);
     const branchName = vehicle.branch || "未指定服務廠";
-    const branch = branchMap.get(branchName) || { name: branchName, vehicles: 0, dormant: 0, expiring: 0, spend: 0 };
+    const branch = branchMap.get(branchName) || { name: branchName, vehicles: 0, dormant: 0, expiring: 0, spend: 0, spendVehicles: 0 };
     branch.vehicles += 1;
     branch.spend += vehicle.spend3m ?? 0;
+    if ((vehicle.spend3m ?? 0) > 0) branch.spendVehicles += 1;
     if ((vehicle.daysSinceVisit ?? 0) >= 365) branch.dormant += 1;
     if (group === "即將過保") branch.expiring += 1;
     branchMap.set(branchName, branch);
@@ -257,7 +358,16 @@ function summarize(records: IndexedVehicle[]) {
   const branchPerformance = [...branchMap.values()]
     .sort((a, b) => (b.dormant + b.expiring) - (a.dormant + a.expiring) || b.vehicles - a.vehicles);
   const countyDistribution = [...countyMap.entries()].map(([name, vehicles]) => ({ name, vehicles })).sort((a, b) => b.vehicles - a.vehicles);
-  return { contactable, expiring, dormant, spend, mileageBands, warranty, serviceMix, branchPerformance, countyDistribution };
+  const rankedModels = [...modelMap.entries()].sort((a, b) => b[1] - a[1]);
+  const modelMix = rankedModels.slice(0, 6).map(([name, vehicles]) => ({ name, vehicles }));
+  const otherModels = rankedModels.slice(6).reduce((sum, [, vehicles]) => sum + vehicles, 0);
+  if (otherModels) modelMix.push({ name: "其他", vehicles: otherModels });
+  const visitMonths = monthKeys.map((month) => ({ month, vehicles: monthCounts.get(month) || 0 }));
+  // 各正式據點（單位代碼為正式者）全部列出；暫用代碼的外部保養地點只計入「裕信全體」。
+  const formalBranches = new Set(records.filter((vehicle) => vehicle._unitFormal).map((vehicle) => vehicle.branch));
+  const branchWarranty = [...branchWarrantyMap.values()].filter((branch) => formalBranches.size ? formalBranches.has(branch.name) : true).sort((a, b) => b.vehicles - a.vehicles).slice(0, formalBranches.size || 16);
+  const branchWarrantyTotal = { name: "裕信全體", vehicles: records.length, 保固內: warranty.保固內, 即將過保: warranty.即將過保, 已過保: warranty.已過保, 待確認: warranty.待確認 };
+  return { contactable, expiring, dormant, spend, spendVehicles, mileageBands, warranty, serviceMix, branchPerformance, countyDistribution, visitMonths, latestVisit, visitWeekdays: weekdays, branchWarrantyTotal, modelMix, branchWarranty };
 }
 
 const sortableFields = {
@@ -299,7 +409,9 @@ function workbookResponse(records: IndexedVehicle[]) {
 export async function GET(request: Request) {
   try {
     const url = new URL(request.url);
-    const allRecords = await loadRecords(request.url);
+    const actor = await requireActor(request);
+    const allRecords = scopeRecords(await loadRecords(request.url), actor);
+    if (url.searchParams.get("meta") === "1") return Response.json(metadataFor(allRecords), { headers: { "Cache-Control": "no-store" } });
     const filtered = sortRecords(filterRecords(allRecords, url.searchParams), url.searchParams);
     if (url.searchParams.get("format") === "xlsx") return workbookResponse(filtered);
     const pageSize = Math.min(100, Math.max(10, numberParam(url.searchParams, "pageSize") ?? 25));
@@ -307,10 +419,11 @@ export async function GET(request: Request) {
     const page = Math.min(totalPages, Math.max(1, numberParam(url.searchParams, "page") ?? 1));
     const start = (page - 1) * pageSize;
     const districtBase = url.searchParams.get("district") ? filterRecords(allRecords, url.searchParams, { ignoreDistrict: true }) : filtered;
-    const metrics = { ...summarize(filtered), districtDistribution: summarizeDistricts(districtBase) };
+    const peopleRole = url.searchParams.get("peopleRole") || "";
+    const people = peopleRole in peopleRoles ? summarizePeople(allRecords, url.searchParams, peopleRole as PeopleRole) : null;
+    const metrics = { ...summarize(filtered), districtDistribution: summarizeDistricts(districtBase), people };
     return Response.json({ records: filtered.slice(start, start + pageSize), total: filtered.length, page, pageSize, metrics }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
-    console.error("vehicle-query-failed", error);
-    return Response.json({ error: "本機資料查詢失敗" }, { status: 500 });
+    return errorResponse(error);
   }
 }
